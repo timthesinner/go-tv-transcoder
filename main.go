@@ -221,7 +221,7 @@ func transcode(episode, outputDir, tempDir string, episodeMeta map[string]string
 
 	// Check for need to deinterlace
 	interlaced, frameData := checkInterlaced(localEpisode)
-	vf := "scale=1920:-1"
+	vf := "scale=1920:-2"
 	if interlaced {
 		vf += ", yadif"
 	}
@@ -238,11 +238,13 @@ func transcode(episode, outputDir, tempDir string, episodeMeta map[string]string
 	transcodeArgs = append(transcodeArgs,
 		"-analyzeduration", "250M", "-probesize", "250M",
 		"-i", localEpisode,
+		"-max_muxing_queue_size", "4096",
 		"-i", episodeSrt,
 		"-i", metadataFile,
 		"-map_metadata", "1",
 		"-map", "0:v:0", "-map", "0:a:0", "-map", "1:s",
-		"-c:v", "libx265", "-vf", vf, "-crf", strconv.Itoa(*crf), "-preset", *speed, "-tune", "fastdecode", "-movflags", "+faststart",
+		"-c:v", *codec, "-vf", vf, "-crf", strconv.Itoa(*crf), "-preset", *speed,
+		"-pix_fmt", *pixFmt, "-tune", "fastdecode", "-movflags", "+faststart",
 		"-c:a", "libopus", "-af", "aformat=channel_layouts='7.1|6.1|5.1|stereo'",
 		"-c:s", "copy", outputEpisode)
 
@@ -284,8 +286,10 @@ func writeMetadata(seriesDir string, metadata map[string]*Transcode) {
 }
 
 var hwaccel = flag.String("hwaccel", "", "Hardware Acceleration Driver")
-var crf = flag.Int("crf", 23, "CRF (Quality Factor)")
+var crf = flag.Int("crf", 21, "CRF (Quality Factor)")
+var codec = flag.String("codec", "libx265", "Video encoding codec")
 var speed = flag.String("speed", "medium", "Encoder speed")
+var pixFmt = flag.String("pix_fmt", "yuv420p", "Video color depth, dont go deeper than yuv420p if your encoding for a pi")
 
 func main() {
 	flag.Parse()
@@ -293,6 +297,12 @@ func main() {
 	outputDir := "/Volumes/downloads/tv/"
 	tempDir := "/Volumes/TEMP_MEDIA/"
 	recordings := "/Volumes/recordings/"
+
+	if flag.NArg() > 3 {
+		outputDir = flag.Arg(0)
+		tempDir = flag.Arg(1)
+		recordings = flag.Arg(2)
+	}
 
 	series, err := ioutil.ReadDir(recordings)
 	handle(err)
