@@ -28,46 +28,52 @@ import (
  * limitations under the License.
  */
 
-func runCommand(command string, args ...string) bool {
-	cmd := exec.Command(command, args...)
+type Program struct {
+	command    string
+	workingDir string
+}
 
+func (prog *Program) runCommand(args ...string) bool {
+	cmd := exec.Command(prog.command, args...)
+	cmd.Dir = prog.workingDir
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 
-	fmt.Println("Running "+command+" with:", args)
+	fmt.Println("Running "+prog.command+" with:", args)
 	err := cmd.Run()
 	if err != nil {
-		fmt.Println("Error executing "+command, err)
+		fmt.Println("Error executing "+prog.command, err)
 		return false
 	}
 	return true
 }
 
-func runCommandOutput(command string, args ...string) string {
-	cmd := exec.Command(command, args...)
-
+func (prog *Program) runCommandOutput(args ...string) string {
+	cmd := exec.Command(prog.command, args...)
+	cmd.Dir = prog.workingDir
 	cmd.Stderr = os.Stderr
 
-	fmt.Println("Running "+command+" with:", args)
+	fmt.Println("Running "+prog.command+" with:", args)
 	output, err := cmd.Output()
 	if err != nil {
-		fmt.Println("Error executing "+command, err)
+		fmt.Println("Error executing "+prog.command, err)
 	}
 
 	return strings.TrimSpace(string(output))
 }
 
-func runCommandCaptureError(command string, args ...string) string {
+func (prog *Program) runCommandCaptureError(args ...string) string {
 	pr, pw := io.Pipe()
 	// we need to wait for everything to be done
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 
-	cmd := exec.Command(command, args...)
+	cmd := exec.Command(prog.command, args...)
+	cmd.Dir = prog.workingDir
 	cmd.Stdout = os.Stdout
 	stdErr, err := cmd.StderrPipe()
 	if err != nil {
-		fmt.Println("Error executing "+command, err)
+		fmt.Println("Error executing "+prog.command, err)
 	}
 	tee := io.TeeReader(stdErr, pw)
 
@@ -91,11 +97,26 @@ func runCommandCaptureError(command string, args ...string) string {
 		}
 	}()
 
-	fmt.Println("Running "+command+" with:", args)
+	fmt.Println("Running "+prog.command+" with:", args)
 	if err := cmd.Run(); err != nil {
-		fmt.Println("Error executing "+command, err)
+		fmt.Println("Error executing "+prog.command, err)
 	}
 
 	wg.Wait()
 	return strings.TrimSpace(output)
+}
+
+func runCommand(command string, args ...string) bool {
+	prog := &Program{command: command}
+	return prog.runCommand(args...)
+}
+
+func runCommandOutput(command string, args ...string) string {
+	prog := &Program{command: command}
+	return prog.runCommandOutput(args...)
+}
+
+func runCommandCaptureError(command string, args ...string) string {
+	prog := &Program{command: command}
+	return prog.runCommandCaptureError(args...)
 }

@@ -11,7 +11,6 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -81,9 +80,8 @@ func handle(err error) {
 var regex = regexp.MustCompile(`(?P<series>.+)\..*;-?(?P<episode>.*?)-?(?P<number>S\d+E\d+).*\.ts`)
 var deinterlaceRegex = regexp.MustCompile(`(?i)Multi frame detection: TFF:\s+(?P<tff>\d+)\s*BFF:\s+(?P<bff>\d+)\s*Progressive:\s+(?P<progressive>\d+)\s*Undetermined:\s+(?P<undetermined>\d+)`)
 
-func checkInterlaced(episode string) (bool, map[string]string) {
-	metadata := runCommandCaptureError("ffmpeg", "-hide_banner", "-i", episode, "-map", "0:0", "-vf", "idet", "-frames:v", "5000", "-an", "-c", "rawvideo", "-y", "-f", "rawvideo", "/dev/null")
-	results := groupsFromRegex(deinterlaceRegex, metadata)
+func checkInterlaced(ffmpeg *Program, episode string) (bool, map[string]string) {
+	results := groupsFromRegex(deinterlaceRegex, checkForInterlaced(ffmpeg, episode))
 
 	tff, err := strconv.Atoi(results["tff"])
 	handle(err)
@@ -116,11 +114,11 @@ func episodeMeta(episode string) map[string]string {
 	return md
 }
 
-func subtitles(dir string, localEpisode string) string {
-	episodeSrt := path.Join(dir, "episode-raw.srt")
-	runCommand("ffmpeg", "-f", "lavfi", "-i", fmt.Sprintf("movie=%s[out0+subcc]", localEpisode), episodeSrt)
+func subtitles(ffmpeg *Program, localEpisode string) string {
+	episodeSrt := "episode-raw.srt"
+	ffmpeg.runCommand("-f", "lavfi", "-i", fmt.Sprintf("movie=%s[out0+subcc]", localEpisode), episodeSrt)
 
-	rawSubs, err := ioutil.ReadFile(episodeSrt)
+	rawSubs, err := ioutil.ReadFile(filepath.Join(ffmpeg.workingDir, episodeSrt))
 	handle(err)
 
 	cleanSubs := strings.Replace(string(rawSubs), "\\h", "", -1)
@@ -133,13 +131,13 @@ func subtitles(dir string, localEpisode string) string {
 	// Unfragment the subtitles
 	subs.Unfragment()
 
-	outputSrt := path.Join(dir, "episode.srt")
+	outputSrt := filepath.Join(ffmpeg.workingDir, "episode.srt")
 	handle(subs.Write(outputSrt))
-	return outputSrt
+	return "episode.srt"
 }
 
 func chapters(dir string, edl string, duration float64) []*Chapter {
-	edlFile, err := os.Open(path.Join(dir, edl))
+	edlFile, err := os.Open(filepath.Join(dir, edl))
 	handle(err)
 	defer edlFile.Close()
 
@@ -187,17 +185,24 @@ func transcode(episode, outputDir, tempDir string, episodeMeta map[string]string
 	}
 	defer os.RemoveAll(dir)
 
-	localEpisode := path.Join(dir, "episode.ts")
-	runCommand("cp", episode, localEpisode)
+	localEpisode := filepath.Join(dir, "episode.ts")
+	copy(episode, localEpisode)
 
 	// Export and clean subtitles
-	episodeSrt := subtitles(dir, localEpisode)
+	ffmpeg := &Program{command: "ffmpeg", workingDir: dir}
+	episodeSrt := subtitles(ffmpeg, "episode.ts")
 
-	iniFile := path.Join(dir, "comskip.ini")
+	iniFile := filepath.Join(dir, "comskip.ini")
 	handle(ioutil.WriteFile(iniFile, []byte("output_edl=1\n"), 0644))
 
-	runCommand("./Comskip/comskip", "--ini="+iniFile, "-ts", "--hwassist", "-w", "--output="+dir, localEpisode)
-	duration, err := strconv.ParseFloat(runCommandOutput("ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", localEpisode), 64)
+	if !comskip(iniFile, dir, localEpisode) {
+		fmt.Println("Could not execute comskip, check error logs")
+		os.Exit(1)
+		return nil
+	}
+
+	ffprobe := &Program{command: "ffprobe", workingDir: dir}
+	duration, err := strconv.ParseFloat(ffprobe.runCommandOutput("-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", "episode.ts"), 64)
 	handle(err)
 
 	chapters := chapters(dir, "episode.edl", duration)
@@ -211,16 +216,15 @@ func transcode(episode, outputDir, tempDir string, episodeMeta map[string]string
 		"Chapters": chapters,
 	})
 
-	metadataFile := path.Join(dir, "episode.ffmpeg.metadata")
+	metadataFile := filepath.Join(dir, "episode.ffmpeg.metadata")
 	ffmpegMetadata := strings.TrimSpace(tpl.String()) + "\n"
 	ioutil.WriteFile(metadataFile, []byte(ffmpegMetadata), 0644)
 
 	showDir := filepath.Join(outputDir, episodeMeta["series"])
 	os.MkdirAll(showDir, os.ModePerm)
-	outputEpisode := filepath.Join(showDir, fmt.Sprintf("%s.mkv", episodeTitle))
 
 	// Check for need to deinterlace
-	interlaced, frameData := checkInterlaced(localEpisode)
+	interlaced, frameData := checkInterlaced(ffmpeg, "episode.ts")
 	vf := "scale=1920:-2"
 	if interlaced {
 		vf += ", yadif"
@@ -237,22 +241,24 @@ func transcode(episode, outputDir, tempDir string, episodeMeta map[string]string
 
 	transcodeArgs = append(transcodeArgs,
 		"-analyzeduration", "250M", "-probesize", "250M",
-		"-i", localEpisode,
-		"-max_muxing_queue_size", "4096",
+		"-i", "episode.ts",
 		"-i", episodeSrt,
-		"-i", metadataFile,
+		"-i", "episode.ffmpeg.metadata",
 		"-map_metadata", "1",
 		"-map", "0:v:0", "-map", "0:a:0", "-map", "1:s",
 		"-c:v", *codec, "-vf", vf, "-crf", strconv.Itoa(*crf), "-preset", *speed,
 		"-pix_fmt", *pixFmt, "-tune", "fastdecode", "-movflags", "+faststart",
 		"-c:a", "libopus", "-af", "aformat=channel_layouts='7.1|6.1|5.1|stereo'",
-		"-c:s", "copy", outputEpisode)
+		"-c:s", "copy", "transcoded-episode.ts")
 
-	runCommand("rm", "-f", outputEpisode)
-	result := runCommand("ffmpeg", transcodeArgs...)
+	result := ffmpeg.runCommand(transcodeArgs...)
 	if !result {
 		return nil
 	}
+
+	outputEpisode := filepath.Join(showDir, fmt.Sprintf("%s.mkv", episodeTitle))
+	remove(outputEpisode)
+	copy(filepath.Join(dir, "transcoded-episode.ts"), outputEpisode)
 
 	return &Transcode{
 		Original:    episode,
@@ -266,7 +272,7 @@ func transcode(episode, outputDir, tempDir string, episodeMeta map[string]string
 }
 
 func readMetadata(seriesDir string) (ret map[string]*Transcode) {
-	seriesMeta, err := os.Open(path.Join(seriesDir, "transcode-metadata.json"))
+	seriesMeta, err := os.Open(filepath.Join(seriesDir, "transcode-metadata.json"))
 	if err != nil {
 		return make(map[string]*Transcode)
 	}
@@ -277,7 +283,7 @@ func readMetadata(seriesDir string) (ret map[string]*Transcode) {
 }
 
 func writeMetadata(seriesDir string, metadata map[string]*Transcode) {
-	seriesMeta, err := os.OpenFile(path.Join(seriesDir, "transcode-metadata.json"), os.O_WRONLY|os.O_CREATE, 0644)
+	seriesMeta, err := os.OpenFile(filepath.Join(seriesDir, "transcode-metadata.json"), os.O_WRONLY|os.O_CREATE, 0644)
 	handle(err)
 	defer seriesMeta.Close()
 
@@ -298,7 +304,7 @@ func main() {
 	tempDir := "/Volumes/TEMP_MEDIA/"
 	recordings := "/Volumes/recordings/"
 
-	if flag.NArg() > 3 {
+	if flag.NArg() == 3 {
 		outputDir = flag.Arg(0)
 		tempDir = flag.Arg(1)
 		recordings = flag.Arg(2)
